@@ -34,3 +34,4 @@ Professional video creation tool powered by AI (Gemini and ElevenLabs APIs)
 2. Install requirements:
    ```bash
    pip install -r requirements.txt
+   python main.py
