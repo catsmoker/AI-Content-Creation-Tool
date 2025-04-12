@@ -1,0 +1,8 @@
+google-generativeai
+requests
+beautifulsoup4
+moviepy
+pillow
+python-docx
+sv-ttk
+numpy
