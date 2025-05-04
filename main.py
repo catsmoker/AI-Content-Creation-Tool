@@ -3,7 +3,18 @@ import io
 import requests
 from bs4 import BeautifulSoup
 import json
-from moviepy import ImageSequenceClip, AudioFileClip, concatenate_videoclips
+from moviepy import (
+    VideoClip,
+    VideoFileClip,
+    ImageSequenceClip,
+    ImageClip,
+    TextClip,
+    ColorClip,
+    AudioFileClip,
+    AudioClip,
+    CompositeVideoClip,
+    vfx,
+)
 import sys
 import re
 from PIL import Image, ImageDraw, ImageFont
@@ -15,11 +26,13 @@ from datetime import datetime
 import logging
 import subprocess
 import numpy as np
-import moviepy.video.fx as vfx
 from docx import Document
 import time
 import pickle
 from pathlib import Path
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from google_auth_oauthlib.flow import InstalledAppFlow
 
 try:
     import google.generativeai as genai
@@ -28,11 +41,53 @@ except ImportError:
     GEMINI_AVAILABLE = False
     logging.warning("google.generativeai not available")
 
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     filename='ai_content_creator.log'
 )
+
+class YouTubeAPI:
+    def __init__(self):
+        # Path to your client secrets file (download from Google Cloud Console)
+        self.CLIENT_SECRETS_FILE = "client_secrets.json"
+        self.SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
+        self.youtube = self.authenticate()
+
+    def authenticate(self):
+        flow = InstalledAppFlow.from_client_secrets_file(
+            self.CLIENT_SECRETS_FILE, self.SCOPES)
+        credentials = flow.run_local_server(port=0)
+        return build('youtube', 'v3', credentials=credentials)
+
+    def upload_video(self, file_path, title, description, category_id='22', privacy_status='private'):
+        try:
+            body = {
+                'snippet': {
+                    'title': title,
+                    'description': description,
+                    'categoryId': category_id  # 22 is the category ID for "People & Blogs"
+                },
+                'status': {
+                    'privacyStatus': privacy_status
+                }
+            }
+
+            media = MediaFileUpload(file_path, resumable=True)
+
+            request = self.youtube.videos().insert(
+                part='snippet,status',
+                body=body,
+                media_body=media
+            )
+
+            response = request.execute()
+            logging.info(f"Video uploaded successfully: {response['id']}")
+            return response
+        except Exception as e:
+            logging.error(f"YouTube upload failed: {str(e)}")
+            raise
 
 class VideoCreatorApp:
     def __init__(self, root):
@@ -49,7 +104,9 @@ class VideoCreatorApp:
         self.setup_ui()
         self.create_output_folder()
         self.running = False
-    
+        self.youtube_api = None
+        self.imagemagick_path = r"C:\Program Files\ImageMagick\magick.exe"
+
     def load_api_keys(self):
         try:
             if os.path.exists(self.api_keys_file):
@@ -58,7 +115,7 @@ class VideoCreatorApp:
         except Exception as e:
             logging.error(f"Error loading API keys: {str(e)}")
         return {'gemini': '', 'elevenlabs': ''}
-    
+
     def save_api_keys(self):
         try:
             with open(self.api_keys_file, 'wb') as f:
@@ -72,7 +129,7 @@ class VideoCreatorApp:
     def create_output_folder(self):
         self.output_dir = os.path.join(os.path.expanduser("~"), "Desktop", "AI_Videos_Pro")
         os.makedirs(self.output_dir, exist_ok=True)
-    
+
     def setup_ui(self):
         main_frame = ttk.Frame(self.root, padding=(30, 20))
         main_frame.pack(fill="both", expand=True)
@@ -105,11 +162,6 @@ class VideoCreatorApp:
         ).pack(side="left", expand=True, padx=10)
         ttk.Button(
             button_frame,
-            text="Preview",
-            command=self.generate_preview
-        ).pack(side="left", expand=True, padx=10)
-        ttk.Button(
-            button_frame,
             text="Create Content",
             style="Accent.TButton",
             command=self.start_creation_process
@@ -118,7 +170,7 @@ class VideoCreatorApp:
         self.status_frame.pack(fill="x", side="bottom")
         self.status_label = ttk.Label(self.status_frame, text="Ready", anchor="w")
         self.status_label.pack(fill="x", padx=10)
-    
+
     def setup_api_tab(self):
         api_tab = ttk.Frame(self.notebook, padding=20)
         self.notebook.add(api_tab, text="API Settings")
@@ -136,7 +188,7 @@ class VideoCreatorApp:
         self.eleven_entry = ttk.Entry(eleven_frame, width=50)
         self.eleven_entry.insert(0, self.saved_api_keys['elevenlabs'])
         self.eleven_entry.pack(side="right", expand=True, fill="x", padx=5)
-    
+
     def setup_content_tab(self):
         content_tab = ttk.Frame(self.notebook, padding=20)
         self.notebook.add(content_tab, text="Content Settings")
@@ -181,7 +233,7 @@ class VideoCreatorApp:
             text="Browse...",
             command=self.select_output_folder
         ).pack(side="right", padx=5)
-    
+
     def setup_effects_tab(self):
         effects_tab = ttk.Frame(self.notebook, padding=20)
         self.notebook.add(effects_tab, text="Video Effects")
@@ -204,13 +256,13 @@ class VideoCreatorApp:
         ttk.Label(duration_frame, text="Image Duration (sec):", font=self.button_font).pack(side="left", padx=5)
         self.img_duration_var = tk.IntVar(value=5)
         ttk.Entry(duration_frame, textvariable=self.img_duration_var, width=5).pack(side="right", padx=5)
-    
+
     def select_output_folder(self):
         folder = filedialog.askdirectory(title="Select Output Folder")
         if folder:
             self.output_var.set(folder)
             self.output_dir = folder
-    
+
     def test_api_connection(self):
         try:
             if not GEMINI_AVAILABLE:
@@ -226,88 +278,7 @@ class VideoCreatorApp:
             messagebox.showinfo("Success", "Both API connections are working!")
         except Exception as e:
             self.show_error(f"API Connection Failed:\n{str(e)}")
-    
-    def generate_preview(self):
-        if self.running:
-            return
-        try:
-            self.running = True
-            if not self.validate_inputs():
-                self.running = False
-                return
-            self.progress_window = tk.Toplevel(self.root)
-            self.progress_window.title("Creating Preview")
-            self.progress_window.geometry("400x200")
-            self.progress_window.protocol("WM_DELETE_WINDOW", self.cancel_creation)
-            frame = ttk.Frame(self.progress_window, padding=20)
-            frame.pack(fill="both", expand=True)
-            self.progress_label = ttk.Label(frame, text="Creating 10-second preview...", font=self.subtitle_font)
-            self.progress_label.pack(pady=5)
-            self.progress_bar = ttk.Progressbar(frame, orient="horizontal", length=300, mode="determinate")
-            self.progress_bar.pack(pady=10)
-            self.cancel_button = ttk.Button(
-                frame,
-                text="Cancel",
-                command=self.cancel_creation
-            )
-            self.cancel_button.pack(pady=5)
-            self.root.after(100, self._generate_preview_content)
-        except Exception as e:
-            self.show_error(f"Failed to start preview: {str(e)}")
-            self.running = False
-    
-    def _generate_preview_content(self):
-        try:
-            self.update_progress(20, "Generating preview script...")
-            script = self.generate_script()[:500]
-            if not script or not self.running:
-                return
-            self.update_progress(40, "Generating preview voiceover...")
-            voiceover_path = self.generate_voiceover(script[:300])
-            if not voiceover_path or not self.running:
-                return
-            self.update_progress(60, "Downloading preview images...")
-            image_folder = "temp_preview_images"
-            os.makedirs(image_folder, exist_ok=True)
-            self.download_images(script, image_folder, max_images=2)
-            if not self.running:
-                return
-            self.update_progress(80, "Creating preview video...")
-            preview_path = os.path.join(self.output_dir, "preview.mp4")
-            audio_clip = AudioFileClip(voiceover_path)
-            target_duration = min(10, audio_clip.duration)
-            image_files = [os.path.join(image_folder, f) for f in os.listdir(image_folder) 
-                          if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-            if image_files:
-                clips = []
-                duration_per_image = target_duration / len(image_files)
-                for img in image_files:
-                    clip = ImageSequenceClip([img], durations=[duration_per_image])
-                    clip = clip.resize(height=1080)
-                    clips.append(clip)
-                final_clip = concatenate_videoclips(clips)
-                final_clip = final_clip.set_audio(audio_clip.subclip(0, target_duration))
-                final_clip.write_videofile(
-                    preview_path,
-                    fps=24,
-                    codec="libx264",
-                    audio_codec="aac",
-                    threads=4,
-                    logger=None
-                )
-            self.cleanup_temp_files(image_folder, voiceover_path)
-            self.update_progress(100, "Preview created!")
-            self.show_success(f"Preview created successfully!\n\nSaved to:\n{preview_path}")
-            if os.path.exists(preview_path):
-                subprocess.Popen(f'explorer "{os.path.dirname(preview_path)}"')
-        except Exception as e:
-            self.show_error(f"Preview creation failed: {str(e)}")
-            logging.exception("Preview creation error")
-        finally:
-            self.running = False
-            if hasattr(self, 'progress_window') and self.progress_window:
-                self.progress_window.destroy()
-    
+
     def start_creation_process(self):
         if self.running:
             return
@@ -336,7 +307,7 @@ class VideoCreatorApp:
         except Exception as e:
             self.show_error(f"Failed to start creation process: {str(e)}")
             self.running = False
-    
+
     def validate_inputs(self):
         if not self.gemini_entry.get().strip():
             self.show_error("Please enter your Gemini API key")
@@ -348,33 +319,51 @@ class VideoCreatorApp:
             self.show_error("google.generativeai package is not installed")
             return False
         return True
-    
+
     def cancel_creation(self):
         self.running = False
         if hasattr(self, 'progress_window') and self.progress_window:
             self.progress_window.destroy()
         self.update_status("Creation cancelled")
-    
+
     def update_progress(self, value, message):
         if hasattr(self, 'progress_window') and self.progress_window:
             self.progress_bar['value'] = value
             self.progress_label['text'] = message
             self.progress_window.update()
-    
+
     def update_status(self, message):
         self.status_label['text'] = message
         self.root.update()
-    
+
     def show_error(self, message):
         messagebox.showerror("Error", message)
         logging.error(message)
         self.update_status(f"Error: {message}")
-    
+
     def show_success(self, message):
         messagebox.showinfo("Success", message)
         logging.info(message)
         self.update_status(message)
-    
+
+    def preprocess_image_with_imagemagick(self, image_path, output_path):
+        """Use ImageMagick to preprocess images (resize and convert to a compatible format)."""
+        try:
+            # Command to resize image to 1920x1080 and convert to JPEG
+            cmd = [
+                self.imagemagick_path,
+                image_path,
+                "-resize", "1920x1080",
+                "-quality", "90",
+                output_path
+            ]
+            subprocess.run(cmd, check=True, capture_output=True)
+            logging.info(f"Preprocessed image: {image_path} -> {output_path}")
+            return True
+        except subprocess.CalledProcessError as e:
+            logging.warning(f"ImageMagick preprocessing failed for {image_path}: {str(e)}")
+            return False
+
     def create_content(self):
         if not self.running:
             return
@@ -399,11 +388,22 @@ class VideoCreatorApp:
             self.download_images(script, image_folder)
             if not self.running:
                 return
+            self.update_progress(60, "Preprocessing images with ImageMagick...")
+            # Preprocess images using ImageMagick
+            processed_image_folder = "processed_images"
+            os.makedirs(processed_image_folder, exist_ok=True)
+            for img_file in os.listdir(image_folder):
+                img_path = os.path.join(image_folder, img_file)
+                processed_img_path = os.path.join(processed_image_folder, f"processed_{img_file}")
+                if not self.preprocess_image_with_imagemagick(img_path, processed_img_path):
+                    continue
             self.update_progress(80, "Creating video...")
-            video_path = self.create_video_with_effects(image_folder, voiceover_path)
-            self.cleanup_temp_files(image_folder, voiceover_path)
+            video_path = self.create_video_with_effects(processed_image_folder, voiceover_path)
+            self.cleanup_temp_files(image_folder, voiceover_path, processed_image_folder)
+            self.update_progress(90, "Uploading to YouTube...")
+            self.upload_to_youtube(video_path)
             self.update_progress(100, "Process completed!")
-            self.show_success(f"Video created successfully!\n\nSaved to:\n{video_path}")
+            self.show_success(f"Video created and uploaded successfully!\n\nSaved to:\n{video_path}")
             if os.path.exists(video_path):
                 subprocess.Popen(f'explorer "{os.path.dirname(video_path)}"')
         except Exception as e:
@@ -415,7 +415,7 @@ class VideoCreatorApp:
             self.running = False
             if hasattr(self, 'progress_window') and self.progress_window:
                 self.progress_window.destroy()
-    
+
     def generate_script(self):
         try:
             api_key = self.gemini_entry.get().strip()
@@ -425,17 +425,8 @@ class VideoCreatorApp:
             content_type = self.content_type_combo.get()
             duration = self.duration_combo.get()
             style = self.style_combo.get()
-            prompt = f"""Create a professional {duration} YouTube script about {content_type} with this structure:
-            1. Engaging hook (first 5-10 seconds)
-            2. 3-5 key points with supporting facts
-            3. Clear transitions between sections
-            4. Call-to-action at the end
-            Style: {style}
-            Tone: Professional but engaging
-            Target audience: General YouTube viewers
-            Make it factual, well-structured, and suitable for voiceover narration.
-            Avoid filler content and maintain consistent quality throughout."""
-            model = genai.GenerativeModel('gemini-1.5-pro')
+            prompt = f"""Craft a compelling {duration} YouTube script paragraph about {content_type} delivered in a {style} Style, incorporating an engaging hook, three distinct key points each supported by factual details, and smooth transitions between these points. Conclude with a clear call to action. The tone should be engaging, targeting a general YouTube audience. Ensure the content is factual, well-structured for narration, avoids filler, and maintains consistent quality, The script should be at least 150 words."""
+            model = genai.GenerativeModel('gemini-2.0-flash')
             response = model.generate_content(
                 prompt,
                 generation_config={
@@ -457,7 +448,7 @@ class VideoCreatorApp:
             self.show_error(error_msg)
             logging.error(f"Script generation error: {str(e)}")
             return None
-    
+
     def validate_script(self, script):
         word_count = len(script.split())
         min_words = 100 if "30 seconds" in self.duration_combo.get() else 150
@@ -469,7 +460,7 @@ class VideoCreatorApp:
             self.show_error("Script contains placeholder/nonsense text")
             return False
         return True
-    
+
     def save_script_to_docx(self, script):
         try:
             doc = Document()
@@ -477,7 +468,7 @@ class VideoCreatorApp:
             doc.add_paragraph(f"Content Type: {self.content_type_combo.get()}")
             doc.add_paragraph(f"Style: {self.style_combo.get()}")
             doc.add_paragraph(f"Duration: {self.duration_combo.get()}")
-            doc.add_paragraph(f"Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            doc.add_paragraph(f"Created: {datetime.now().strftime('%Y-%m-d %H:%M:%S')}")
             doc.add_paragraph("\n")
             for paragraph in script.split('\n'):
                 if paragraph.strip():
@@ -488,7 +479,7 @@ class VideoCreatorApp:
         except Exception as e:
             self.show_error(f"Failed to save script: {str(e)}")
             return None
-    
+
     def generate_voiceover(self, script):
         max_retries = 3
         retry_delay = 5
@@ -568,7 +559,7 @@ class VideoCreatorApp:
             self.show_error(error_msg)
             logging.error(f"Voiceover generation error: {str(e)}")
             return None
-    
+
     def download_images(self, script, output_folder, max_images=5):
         try:
             search_terms = self.extract_keywords(script)
@@ -608,7 +599,7 @@ class VideoCreatorApp:
                 "tbs": "isz:l"
             }
             response = requests.get(
-                "https://www.google.com/search",
+                "https://www.google.com/webhp?as_st=y&as_q=&as_epq=&as_oq=&as_eq=&imgsz=xga&imgar=&imgcolor=&imgtype=&cr=countryUS&as_sitesearch=&tbs=&udm=2",
                 params=params,
                 headers={"User-Agent": "Mozilla/5.0"}
             )
@@ -635,7 +626,7 @@ class VideoCreatorApp:
             logging.warning(f"Google image download failed for {query}: {str(e)}")
             return downloaded
         return downloaded
-    
+
     def create_fallback_image(self, term, output_dir):
         try:
             img = Image.new('RGB', (1920, 1080), color=(30, 30, 40))
@@ -661,7 +652,7 @@ class VideoCreatorApp:
         except Exception as e:
             logging.error(f"Failed to create fallback image: {str(e)}")
             raise
-    
+
     def create_video_with_effects(self, image_folder, audio_file):
         try:
             image_files = self.get_valid_images(image_folder)
@@ -677,7 +668,7 @@ class VideoCreatorApp:
             clips = self.create_video_clips(image_files, duration_per_image)
             if not clips:
                 raise ValueError("Could not create any valid video clips")
-            final_video = concatenate_videoclips(clips, method="compose")
+            final_video = CompositeVideoClip(clips, method="compose")
             try:
                 final_video = final_video.set_audio(audio_clip)
             except AttributeError:
@@ -695,12 +686,16 @@ class VideoCreatorApp:
                 try:
                     with Image.open(img_path) as img:
                         img.verify()
+                    # Additional check for MoviePy compatibility
                     try:
-                        ImageSequenceClip([img_path], durations=[1])
+                        test_clip = ImageSequenceClip([img_path], durations=[1])
+                        test_clip.close()
                         valid_images.append(img_path)
-                    except:
+                    except Exception as e:
+                        logging.warning(f"Image {img_path} is not compatible with MoviePy: {str(e)}")
                         continue
-                except:
+                except Exception as e:
+                    logging.warning(f"Invalid image {img_path}: {str(e)}")
                     continue
         return valid_images
 
@@ -717,14 +712,19 @@ class VideoCreatorApp:
             if not self.running:
                 break
             try:
+                # Create a basic clip
                 img_clip = ImageSequenceClip([img], durations=[duration_per_image])
                 img_clip = img_clip.resize(height=1080)
+
+                # Apply zoom effect
                 zoom_duration = duration_per_image * 0.8
                 zoom_factor = self.zoom_var.get()
                 zoomed_clip = img_clip.fl_time(lambda t: min(t, zoom_duration))
                 zoomed_clip = zoomed_clip.fx(vfx.zoom_in, 
                                            factor=zoom_factor,
                                            zoom_center=(0.5, 0.5))
+
+                # Apply transitions
                 if i > 0 and transition != "None":
                     if transition == "Crossfade":
                         zoomed_clip = zoomed_clip.crossfadein(0.5)
@@ -732,16 +732,18 @@ class VideoCreatorApp:
                         if clips:
                             clips[-1] = clips[-1].fx(vfx.fadeout, 0.5)
                         zoomed_clip = zoomed_clip.fx(vfx.fadein, 0.5)
+                    elif transition == "Slide":
+                        # Simple slide effect (left to right)
+                        zoomed_clip = zoomed_clip.fx(vfx.slide_in, 0.5, 'left')
+
                 clips.append(zoomed_clip)
             except Exception as e:
-                logging.warning(f"Error processing {img}, using simple clip: {str(e)}")
-                try:
-                    simple_clip = ImageSequenceClip([img], durations=[duration_per_image])
-                    simple_clip = simple_clip.resize(height=1080)
-                    clips.append(simple_clip)
-                except:
-                    logging.warning(f"Failed to create clip for {img}, skipping")
-                    continue
+                logging.warning(f"Error processing {img}: {str(e)}")
+                # Skip problematic images instead of failing entirely
+                continue
+
+        if not clips:
+            raise ValueError("No valid video clips were created")
         return clips
 
     def write_video_file(self, final_video, output_path):
@@ -772,28 +774,46 @@ class VideoCreatorApp:
                 ffmpeg_params=['-crf', '23']
             )
 
-    def cleanup_temp_files(self, image_folder, audio_path):
+    def upload_to_youtube(self, video_path):
+        try:
+            if not self.youtube_api:
+                self.youtube_api = YouTubeAPI()
+            title = f"AI Generated {self.content_type_combo.get()} Video - {datetime.now().strftime('%Y-%m-%d')}"
+            description = f"This video was created using AI Content Creator Pro.\n\nContent Type: {self.content_type_combo.get()}\nStyle: {self.style_combo.get()}\nDuration: {self.duration_combo.get()}"
+            response = self.youtube_api.upload_video(
+                file_path=video_path,
+                title=title,
+                description=description,
+                category_id='22',
+                privacy_status='private'
+            )
+            self.show_success(f"Video uploaded to YouTube successfully!\nVideo ID: {response['id']}")
+        except Exception as e:
+            self.show_error(f"Failed to upload to YouTube: {str(e)}")
+
+    def cleanup_temp_files(self, image_folder, audio_path, processed_image_folder=None):
         try:
             if os.path.exists(audio_path):
                 os.remove(audio_path)
             script_path = os.path.join(self.output_dir, "generated_script.docx")
             if os.path.exists(script_path):
                 os.remove(script_path)
-            if os.path.exists(image_folder):
-                for file in os.listdir(image_folder):
-                    file_path = os.path.join(image_folder, file)
+            for folder in [image_folder, processed_image_folder]:
+                if folder and os.path.exists(folder):
+                    for file in os.listdir(folder):
+                        file_path = os.path.join(folder, file)
+                        try:
+                            if os.path.isfile(file_path):
+                                os.remove(file_path)
+                        except Exception as e:
+                            logging.warning(f"Could not delete {file_path}: {str(e)}")
                     try:
-                        if os.path.isfile(file_path):
-                            os.remove(file_path)
+                        os.rmdir(folder)
                     except Exception as e:
-                        logging.warning(f"Could not delete {file_path}: {str(e)}")
-                try:
-                    os.rmdir(image_folder)
-                except Exception as e:
-                    logging.warning(f"Could not remove directory {image_folder}: {str(e)}")
+                        logging.warning(f"Could not remove directory {folder}: {str(e)}")
         except Exception as e:
             logging.warning(f"Cleanup failed: {str(e)}")
-    
+
     def extract_keywords(self, text):
         words = re.findall(r'\b\w{4,}\b', text.lower())
         filtered_words = [w for w in words if w not in [
